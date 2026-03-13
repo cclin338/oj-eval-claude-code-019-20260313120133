@@ -27,63 +27,49 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     // Move current_query to SRAM
     gpu_sim.MoveMatrixToSharedMem(current_query);
 
-    // Step 1: Compute all attention scores Q @ K[j]^T for j=0 to i
-    // This creates a matrix of shape [i+1, i+1] where element [row][col] = Q[row] @ K[col]^T
-    Matrix *all_scores = nullptr;
-
+    // Step 1: Build concatenated K matrix in HBM first (concat is faster in HBM than SRAM)
+    Matrix *keys_all = nullptr;
     for (size_t j = 0; j <= i; ++j) {
-      // Move key to SRAM if needed
-      if (keys[j]->GetPosition() != kInSharedMemory) {
-        gpu_sim.MoveMatrixToSharedMem(keys[j]);
-      }
-
-      // Transpose K[j]: [1, 512] -> [512, 1]
-      Matrix *key_t = matrix_memory_allocator.Allocate("key_t");
-      gpu_sim.Copy(keys[j], key_t, kInSharedMemory);
-      gpu_sim.Transpose(key_t, kInSharedMemory);
-
-      // Compute Q @ K[j]^T: [i+1, 512] @ [512, 1] = [i+1, 1]
-      Matrix *scores_j = matrix_memory_allocator.Allocate("scores_j");
-      gpu_sim.MatMul(current_query, key_t, scores_j);
-      gpu_sim.ReleaseMatrix(key_t);
-
-      // Concatenate scores
       if (j == 0) {
-        all_scores = scores_j;
+        keys_all = matrix_memory_allocator.Allocate("keys_all");
+        gpu_sim.Copy(keys[j], keys_all, kInGpuHbm);
       } else {
-        Matrix *new_scores = matrix_memory_allocator.Allocate("all_scores");
-        gpu_sim.Concat(all_scores, scores_j, new_scores, 1, kInSharedMemory);
-        gpu_sim.ReleaseMatrix(all_scores);
-        gpu_sim.ReleaseMatrix(scores_j);
-        all_scores = new_scores;
+        Matrix *new_keys = matrix_memory_allocator.Allocate("keys_all");
+        gpu_sim.Concat(keys_all, keys[j], new_keys, 0, kInGpuHbm);
+        gpu_sim.ReleaseMatrix(keys_all);
+        keys_all = new_keys;
       }
     }
 
-    // Step 2: Apply softmax to each row of all_scores
-    // all_scores has shape [i+1, i+1]
+    // Move to SRAM and transpose: [i+1, 512] -> [512, i+1]
+    gpu_sim.MoveMatrixToSharedMem(keys_all);
+    gpu_sim.Transpose(keys_all, kInSharedMemory);
+
+    // Step 2: Compute Q @ K^T in one operation: [i+1, 512] @ [512, i+1] = [i+1, i+1]
+    Matrix *all_scores = matrix_memory_allocator.Allocate("all_scores");
+    gpu_sim.MatMul(current_query, keys_all, all_scores);
+    gpu_sim.ReleaseMatrix(keys_all);
+
+    // Step 3: Apply softmax row-wise
     Matrix *all_exp = matrix_memory_allocator.Allocate("all_exp");
     gpu_sim.MatExp(all_scores, all_exp);
     gpu_sim.ReleaseMatrix(all_scores);
 
-    // For each row, compute the sum and divide
+    // Compute row sums and normalize
     Matrix *softmax_matrix = nullptr;
 
     for (size_t row = 0; row <= i; ++row) {
-      // Get row from all_exp
       Matrix *exp_row = matrix_memory_allocator.Allocate("exp_row");
       gpu_sim.GetRow(all_exp, row, exp_row, kInSharedMemory);
 
-      // Sum the row
       Matrix *row_sum = matrix_memory_allocator.Allocate("row_sum");
       gpu_sim.Sum(exp_row, row_sum);
 
-      // Divide row by sum
       Matrix *softmax_row = matrix_memory_allocator.Allocate("softmax_row");
       gpu_sim.MatDiv(exp_row, row_sum, softmax_row);
       gpu_sim.ReleaseMatrix(exp_row);
       gpu_sim.ReleaseMatrix(row_sum);
 
-      // Concatenate rows
       if (row == 0) {
         softmax_matrix = softmax_row;
       } else {
@@ -97,10 +83,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
 
     gpu_sim.ReleaseMatrix(all_exp);
 
-    // Step 3: Concatenate all V matrices into one matrix
-    // V_all has shape [i+1, 512]
+    // Step 4: Build concatenated V matrix
     Matrix *values_all = nullptr;
-
     for (size_t j = 0; j <= i; ++j) {
       if (values[j]->GetPosition() != kInSharedMemory) {
         gpu_sim.MoveMatrixToSharedMem(values[j]);
@@ -117,8 +101,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       }
     }
 
-    // Step 4: Compute softmax_matrix @ values_all
-    // [i+1, i+1] @ [i+1, 512] = [i+1, 512]
+    // Step 5: Compute softmax_matrix @ values_all: [i+1, i+1] @ [i+1, 512] = [i+1, 512]
     Matrix *result = matrix_memory_allocator.Allocate("result");
     gpu_sim.MatMul(softmax_matrix, values_all, result);
     gpu_sim.ReleaseMatrix(softmax_matrix);
